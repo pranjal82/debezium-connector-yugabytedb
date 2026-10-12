@@ -191,11 +191,11 @@ public class TestBaseClass extends AbstractConnectorTest {
     engineCompletionError.set(null);
     countDownLatch = new CountDownLatch(1);
     DebeziumEngine.CompletionCallback wrapperCallback = (success, msg, error) -> {
-      engineCompleted.set(true);
       if (error != null) {
         engineCompletionError.set(error);
         LOGGER.error("Embedded engine completed unsuccessfully: {}", msg, error);
       }
+      engineCompleted.set(true);
       try {
         if (callback != null) {
           callback.handle(success, msg, error);
