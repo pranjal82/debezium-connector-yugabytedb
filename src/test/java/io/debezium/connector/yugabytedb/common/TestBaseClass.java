@@ -460,9 +460,14 @@ public class TestBaseClass extends AbstractConnectorTest {
     }
   }
 
+  /**
+   * Fails the test if the embedded engine has finished ({@link #engineCompleted}) while a consume
+   * loop is still waiting. Does not use {@link EmbeddedEngine#isRunning()}: that flag is false until
+   * the executor thread enters {@code engine.run()}, so checking it would false-positive right after
+   * {@link #startEngine}.
+   */
   protected void failIfEngineStopped(String waitingFor) {
-      boolean stopped = engineCompleted.get() || (engine != null && !engine.isRunning());
-      if (!stopped) {
+      if (!engineCompleted.get()) {
           return;
       }
       if (engineCompletionError.get() != null) {
