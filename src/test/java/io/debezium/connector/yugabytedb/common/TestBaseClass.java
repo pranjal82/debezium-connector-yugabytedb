@@ -27,7 +27,9 @@ import org.testcontainers.containers.YugabyteYSQLContainer;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -48,6 +50,8 @@ public class TestBaseClass extends AbstractConnectorTest {
     protected Map<String, ?> offsetMapForRecords = new HashMap<>();
     protected ExecutorService engineExecutor;
     protected static BlockingArrayQueue<SourceRecord> linesConsumed;
+    protected final AtomicReference<Throwable> engineCompletionError = new AtomicReference<>();
+    protected final AtomicBoolean engineCompleted = new AtomicBoolean();
     protected long callbackDelay = 0;
     protected static List<String> masterFlags =
       new ArrayList<>(
@@ -183,8 +187,15 @@ public class TestBaseClass extends AbstractConnectorTest {
       .with(EmbeddedEngine.OFFSET_FLUSH_INTERVAL_MS, 0)
       .with(EmbeddedEngine.CONNECTOR_CLASS, YugabyteDBgRPCConnector.class);
 
+    engineCompleted.set(false);
+    engineCompletionError.set(null);
     countDownLatch = new CountDownLatch(1);
     DebeziumEngine.CompletionCallback wrapperCallback = (success, msg, error) -> {
+      engineCompleted.set(true);
+      if (error != null) {
+        engineCompletionError.set(error);
+        LOGGER.error("Embedded engine completed unsuccessfully: {}", msg, error);
+      }
       try {
         if (callback != null) {
           callback.handle(success, msg, error);
@@ -323,10 +334,17 @@ public class TestBaseClass extends AbstractConnectorTest {
   protected SourceRecords consumeByTopic(int numRecords) throws InterruptedException {
     SourceRecords records = new SourceRecords();
     int recordsConsumed = 0;
+    long deadline = System.currentTimeMillis() + TimeUnit.MINUTES.toMillis(5);
     while (recordsConsumed < numRecords) {
+      failIfEngineStopped("waiting to consume " + numRecords + " records, consumed " + recordsConsumed);
+      if (System.currentTimeMillis() > deadline) {
+        fail("Timed out waiting to consume " + numRecords + " records, consumed " + recordsConsumed);
+      }
       if (!linesConsumed.isEmpty()) {
         records.add(linesConsumed.poll());
         ++recordsConsumed;
+      } else {
+        Thread.sleep(10);
       }
     }
 
@@ -355,6 +373,12 @@ public class TestBaseClass extends AbstractConnectorTest {
     long stop = now + unit.toMillis(timeout);
     while (System.currentTimeMillis() < stop) {
         if (!linesConsumed.isEmpty()) {
+            break;
+        }
+        try {
+            Thread.sleep(10);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             break;
         }
     }
@@ -436,14 +460,29 @@ public class TestBaseClass extends AbstractConnectorTest {
     }
   }
 
+  protected void failIfEngineStopped(String waitingFor) {
+      boolean stopped = engineCompleted.get() || (engine != null && !engine.isRunning());
+      if (!stopped) {
+          return;
+      }
+      if (engineCompletionError.get() != null) {
+          fail("Engine failed while " + waitingFor, engineCompletionError.get());
+      }
+      if (linesConsumed.isEmpty()) {
+          fail("Engine stopped while " + waitingFor);
+      }
+  }
+
   protected void waitAndFailIfCannotConsume(List<SourceRecord> records, long recordsCount,
                                             long milliSecondsToWait) {
       AtomicLong totalConsumedRecords = new AtomicLong();
       long seconds = milliSecondsToWait / 1000;
       try {
           Awaitility.await()
+              .pollInterval(Duration.ofMillis(50))
               .atMost(Duration.ofSeconds(seconds))
               .until(() -> {
+                  failIfEngineStopped("waiting to consume " + recordsCount + " records, consumed " + totalConsumedRecords.get());
                   int consumed = consumeAvailableRecords(record -> {
                       LOGGER.debug("The record being consumed is " + record);
                       records.add(record);
