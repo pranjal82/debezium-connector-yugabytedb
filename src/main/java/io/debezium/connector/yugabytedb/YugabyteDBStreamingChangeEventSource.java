@@ -1247,25 +1247,21 @@ public class YugabyteDBStreamingChangeEventSource implements
             }
         }
 
-        // Add child tablets to the merger BEFORE removing the parent. Initialize children with the
-        // parent's current safetime to prevent two issues:
-        // 1. Out-of-order emission: Without children in the merger, removing the parent would let
-        //    streamSafeTime jump to min(other tablets), releasing queued messages that should wait
-        //    for child records with intermediate commit times.
-        // 2. Deadlock: Setting children to ZERO while parent has pending messages would make
-        //    streamSafeTime=0, blocking parent's messages (commitTime > 0) from draining.
-        // Children inherit parent's safetime temporarily, then update to their actual CDC safetime
-        // on the first poll.
+        // Add child tablets to the merger BEFORE removing the parent. Without children registered,
+        // removing the parent lets streamSafeTime jump to min(other tablets) and release queued
+        // messages that should wait for child records with intermediate commit times (out-of-order
+        // emission). Children inherit parent's safetime temporarily and update to their actual CDC
+        // safetime on the first poll.
         //
         // KNOWN ISSUE (consistent streaming path only): when explicit checkpointing is enabled,
         // cdc_state for the parent lags behind the merger's released watermark. Children start
-        // from cdc_state and may re-deliver records whose commitTime < parentSafetime, which
-        // causes Merger.setTabletSafeTime to throw AssertionError (Merger.java:102). This makes
-        // the problem visible — the connector restarts and resumes cleanly from the committed
-        // offset. The correct fix requires the consistent path to defer handleTabletSplit until
-        // the child's from_op_id is guaranteed past the merger's already-released watermark
-        // (analogous to the explicit-checkpoint deferral in the non-consistent path at :587-605),
-        // which needs a dedicated change tracked separately.
+        // from cdc_state and may re-deliver records whose commitTime < parentSafetime, causing
+        // Merger.setTabletSafeTime to throw AssertionError. The consistent path calls
+        // handleTabletSplit only from inside merger.isSlotEmpty() (ConsistentStreamingSource:191),
+        // so the parent slot is always empty here — deferral analogous to the non-consistent
+        // explicit-checkpoint path (:587-605) is needed but tracked separately. Task goes FAILED
+        // on AssertionError (ConsistentStreamingSource:280, YugabyteDBErrorHandler.isRetriable
+        // returns false) and requires a manual operator restart.
         if (merger != null) {
             BigInteger parentSafetime = merger.safeTimeForTablet(splitTabletId);
             for (TabletCheckpointPair pair : getTabletListResponse.getTabletCheckpointPairList()) {

@@ -438,6 +438,9 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
             }
 
             // Pass the already-fetched stream info to avoid per-table getDBStreamInfo RPCs.
+            // Save the previous tableIds so Block 2 (getTabletListToPollForCDC catch) can
+            // distinguish tables that were previously tracked from genuinely new ones.
+            final Set<String> previousTableIds = this.tableIds;
             try {
                 this.tableIds = YBClientUtils.fetchTableList(ybClient, this.yugabyteDBConnectorConfig,
                         getStreamInfoResp);
@@ -470,8 +473,19 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                 //
                 // In both cases, let Kafka Connect retry taskConfigs() until the stream catches up.
                 // Only call raiseError when neither condition holds (genuine permanent misconfiguration).
+                //
+                // The sibling-table race (scenario 2) only arises when a prior taskConfigs()
+                // call already succeeded in this connector instance (previousTableIds != null).
+                // On the very first taskConfigs() call (previousTableIds == null) the connector
+                // has never run tasks, so no migration race could have started and any "not in
+                // stream" error is a permanent misconfiguration — fail fast.
+                // For subsequent calls (previousTableIds != null, e.g. task restart or
+                // TablePoller-triggered reconfiguration) the race window is possible, so retry.
+                // This is narrower than the original autoAddNewTables()-only guard but still
+                // overly permissive for task restarts where a previously-tracked table was removed;
+                // that gap requires per-table UUID tracking and is left for a follow-up.
                 boolean isTransientNotInStream = this.usePublication
-                        || this.yugabyteDBConnectorConfig.autoAddNewTables();
+                        || (this.yugabyteDBConnectorConfig.autoAddNewTables() && previousTableIds != null);
 
                 if (raiseOnPermanentError && isPermanentStreamMembership && !isTransientNotInStream) {
                     raiseErrorSafely(e);
@@ -489,8 +503,11 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
             }
 
             this.hashRanges = new ArrayList<>();
+            // Tracks the tableId currently being processed so the catch block can reference it
+            String lastTableId = null;
             try {
                 for (String tableId : tableIds) {
+                    lastTableId = tableId;
                     YBTable table = ybClient.openTableByUUID(tableId);
                     // Reuse the existing YBClient for the first attempt to avoid per-table TLS handshakes;
                     // retries (if any) fall back to a fresh client internally.
@@ -524,9 +541,20 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                 // getTabletListToPollForCDC (e.g. dropped mid-taskConfigs(), or a sibling table
                 // in the same migration batch not yet propagated).  Let Kafka Connect retry
                 // taskConfigs() rather than going FAILED permanently in those cases.
+                //
+                // Narrow the autoAddNewTables guard by checking whether the failing tableId was
+                // tracked in the previous successful task configuration (previousTableIds).
+                // If it was previously tracked, it must have been removed from the stream —
+                // that is permanent regardless of auto.add.new.tables.
+                // If it is a new table (not in previousTableIds), the propagation-lag race applies.
                 if (e instanceof DebeziumException) {
+                    // lastTableId holds the UUID of the table that caused the exception.
+                    // If it was absent from the previous successful config it is a new table
+                    // (propagation-lag race); if it was present it was removed from the stream
+                    // (permanent). previousTableIds == null means first-ever taskConfigs() run.
+                    boolean isNewTable = previousTableIds == null || !previousTableIds.contains(lastTableId);
                     boolean isTransientNotInStream = this.usePublication
-                            || this.yugabyteDBConnectorConfig.autoAddNewTables();
+                            || (this.yugabyteDBConnectorConfig.autoAddNewTables() && isNewTable);
                     if (raiseOnPermanentError && !isTransientNotInStream) {
                         raiseErrorSafely(e);
                     }

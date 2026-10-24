@@ -52,8 +52,13 @@ import io.debezium.connector.yugabytedb.common.YugabyteDBContainerTestBase;
  * to ready, stops the connector, deletes the stream, then restarts. The connector's
  * {@code taskConfigs()} calls {@code validateTServerConnection(..., raiseOnPermanentError=true)},
  * which calls {@code getDBStreamInfo} to fetch stream metadata. That master RPC detects the
- * deleted stream (OBJECT_NOT_FOUND) and calls {@code context().raiseError()}, stopping the task
- * fail-fast. Live stream-delete during active {@code GetChanges} streaming polling is not
+ * deleted stream (OBJECT_NOT_FOUND); {@code validateTServerConnection} throws a
+ * {@code DebeziumException} wrapping the error, which EmbeddedEngine captures and propagates as
+ * the completion failure (fail-fast). In production, {@code raiseErrorSafely} would also call
+ * {@code context().raiseError()}; that path is not exercised under EmbeddedEngine because
+ * {@code context()} returns an internal anonymous class that does not implement
+ * {@code SourceConnectorContext} and the {@code ClassCastException} is silently swallowed.
+ * Live stream-delete during active {@code GetChanges} streaming polling is not
  * reliably testable: {@code deleteCDCStream} (a master RPC) removes the stream's {@code cdc_state}
  * entries, but the tserver's CDC service may return a retryable error code (e.g.
  * {@code TABLE_NOT_FOUND}) rather than the fatal {@code "could not find cdc stream"} message on
