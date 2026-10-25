@@ -66,7 +66,14 @@ public class Merger {
     public synchronized void addMessage(Message message) {
         assert message.record.getRowMessage().getOp() != CdcService.RowMessage.Op.DDL;
 
-        ensureTablet(message.tablet);
+        //a removed tablet (e.g. a split parent retired via
+        // removeTablet) must not be silently re-registered with ZERO safetime. If the tablet
+        // is absent it was either never registered (caller bug) or was intentionally removed.
+        if (!mergeSlots.containsKey(message.tablet)) {
+            LOGGER.error("addMessage called for unregistered or removed tablet {}; " +
+                         "ignoring to prevent silent re-registration at ZERO safetime", message.tablet);
+            return;
+        }
         setTabletSafeTime(message.tablet, message.commitTime, message); // TODO: Verify what happens if we move this inside the block
         if (message.record.getRowMessage().getOp() == CdcService.RowMessage.Op.SAFEPOINT) {
             LOGGER.debug("Received safe point message {}", message);
@@ -91,11 +98,21 @@ public class Merger {
 
     /**
      * Set the safetime for the tablet to the given value.
+     * The tablet must already be registered via {@link #ensureTablet} before this is called.
+     * Throws {@link IllegalStateException} if the tablet is unknown or was removed via
+     * {@link #removeTablet}, to prevent silent re-registration at ZERO safetime.
      * @param tabletId the tablet UUID for which the safetime needs to be set
      * @param safeTime the safetime to be set
      */
     public void setTabletSafeTime(String tabletId, BigInteger safeTime, Message m) {
-        ensureTablet(tabletId);
+        //  callers must register the tablet explicitly via
+        // ensureTablet() before calling this method. A missing tablet means the tablet was
+        // removed (removeTablet) or the caller has a bug — fail loudly rather than silently
+        // re-registering with ZERO safetime and freezing streamSafeTime().
+        if (!tabletSafeTime.containsKey(tabletId)) {
+            throw new IllegalStateException(
+                    "setTabletSafeTime called for unregistered or removed tablet: " + tabletId);
+        }
         // TODO: Wrap this assert under flag.
         // If the safetime we are setting is less than the already set value then it would indicate
         // that we are moving backward in time, which is wrong. Throw an assertion error in that case.
@@ -202,11 +219,14 @@ public class Merger {
 
     /**
      * @param tabletId tablet UUID
-     * @return true if the merge slot for the given tablet is empty, false otherwise
+     * @return true if the merge slot for the given tablet is empty or the tablet is not
+     *         registered (e.g. already removed via {@link #removeTablet}), false otherwise.
+     *         Does NOT register the tablet as a side effect — use {@link #ensureTablet} explicitly
+     *         if registration is needed.
      */
     public boolean isSlotEmpty(String tabletId) {
-        ensureTablet(tabletId);
-        return mergeSlots.get(tabletId).isEmpty();
+        List<Message> slot = mergeSlots.get(tabletId);
+        return slot == null || slot.isEmpty();
     }
 
     /**

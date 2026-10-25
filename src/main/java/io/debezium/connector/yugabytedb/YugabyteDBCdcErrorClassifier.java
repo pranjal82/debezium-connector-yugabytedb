@@ -217,9 +217,9 @@ final class YugabyteDBCdcErrorClassifier {
      * checked. Three situations where this can happen:
      * <ol>
      *   <li>Stream validation: {@code validateTServerConnection} calls {@code getDBStreamInfo}
-     *       ({@code YugabyteDBgRPCConnector:415}). The catch at {@code :416-428} checks
-     *       {@code isFailFast(e)} at line {@code :424}. Under a real
-     *       {@code SourceConnectorContext} (production), {@code raiseErrorSafely} at {@code :425}
+     *       ({@code YugabyteDBgRPCConnector:427}). The catch at {@code :428-440} checks
+     *       {@code isFailFast(e)} at line {@code :436}. Under a real
+     *       {@code SourceConnectorContext} (production), {@code raiseErrorSafely} at {@code :437}
      *       calls {@code context().raiseError()} to stop the {@code taskConfigs()} retry loop.
      *       Under {@code EmbeddedEngine} (tests), {@code context()} is not a
      *       {@code SourceConnectorContext}, so the {@code ClassCastException} is silently
@@ -233,11 +233,11 @@ final class YugabyteDBCdcErrorClassifier {
      *       {@code throwIfFailFast}. If the table is dropped between the preceding discovery step
      *       and that call, the master returns {@code OBJECT_NOT_FOUND} and the task stops
      *       immediately. This is a production-only concurrent-DDL race.
-     *       Note: call sites such as {@code YugabyteDBgRPCConnector:494} and
+     *       Note: call sites such as {@code YugabyteDBgRPCConnector:530} and
      *       {@code YugabyteDBStreamingChangeEventSource:364} also call {@code openTableByUUID}
-     *       but are <em>outside</em> {@code throwIfFailFast} catch. At {@code :494}, the catch at
-     *       {@code :518-545} checks {@code isFailFast} and calls {@code raiseErrorSafely} at
-     *       {@code :540} for permanent errors (e.g. {@code OBJECT_NOT_FOUND}) before wrapping as
+     *       but are <em>outside</em> {@code throwIfFailFast} catch. At {@code :530}, the catch at
+     *       {@code :554-602} checks {@code isFailFast} and calls {@code raiseErrorSafely} at
+     *       {@code :596} for permanent errors (e.g. {@code OBJECT_NOT_FOUND}) before wrapping as
      *       "Error while fetching all the tablets". At {@code :364}, the exception propagates
      *       uncaught.
      *       Note: a table explicitly excluded from the stream produces a {@link
