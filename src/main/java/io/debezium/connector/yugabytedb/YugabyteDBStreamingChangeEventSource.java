@@ -833,14 +833,10 @@ public class YugabyteDBStreamingChangeEventSource implements
 
                             tabletSafeTime.put(part.getId(), response.getResp().getSafeHybridTime());
 
-                            // In cases where there are no transactions on the server, the response checkpoint
-                            // can still move ahead and we should also move the explicit checkpoint forward,
-                            // given that it was already greater than the lsn of the last seen valid record.
-                            // Otherwise the explicit checkpoint can get stuck at older values, and upon
-                            // connector restart we will resume from an older point than necessary. Quiet
-                            // tablets (DDL-only, excluded colocated tables, empty transactions) also need
-                            // checkpoint advancement to prevent WAL retention buildup and eventual
-                            // CHECKPOINT_TOO_OLD failures.
+                            // In cases where there is no transactions on the server, the response checkpoint can still move ahead and we should
+                            // also move the explicit checkpoint forward, given that it was already greater than the lsn of the last seen valid record.
+                            // Otherwise the explicit checkpoint can get stuck at older values, and upon connector restart
+                            // we will resume from an older point than necessary.
                             if (taskContext.shouldEnableExplicitCheckpointing() && !TEST_STOP_ADVANCING_CHECKPOINTS) {
                                 OpId lastRecordCheckpoint = offsetContext.getSourceInfo(part).lastRecordCheckpoint();
                                 if (lastRecordCheckpoint == null || lastRecordCheckpoint.isLesserThanOrEqualTo(explicitCheckpoint)) {
@@ -1247,21 +1243,10 @@ public class YugabyteDBStreamingChangeEventSource implements
             }
         }
 
-        // Add child tablets to the merger BEFORE removing the parent. Without children registered,
-        // removing the parent lets streamSafeTime jump to min(other tablets) and release queued
-        // messages that should wait for child records with intermediate commit times (out-of-order
-        // emission). Children inherit parent's safetime temporarily and update to their actual CDC
-        // safetime on the first poll.
-        //
-        // KNOWN ISSUE (consistent streaming path only): when explicit checkpointing is enabled,
-        // cdc_state for the parent lags behind the merger's released watermark. Children start
-        // from cdc_state and may re-deliver records whose commitTime < parentSafetime, causing
-        // Merger.setTabletSafeTime to throw AssertionError. The consistent path calls
-        // handleTabletSplit only from inside merger.isSlotEmpty() (ConsistentStreamingSource:191),
-        // so the parent slot is always empty here — deferral analogous to the non-consistent
-        // explicit-checkpoint path (:587-605) is needed but tracked separately. Task goes FAILED
-        // on AssertionError (ConsistentStreamingSource:280, YugabyteDBErrorHandler.isRetriable
-        // returns false) and requires a manual operator restart.
+        // Register children with the parent's safetime before removing the parent,
+        // so streamSafeTime cannot jump ahead and emit queued records out of order.
+        // With explicit checkpointing, a child can re-deliver records below that
+        // safetime and setTabletSafeTime throws AssertionError. Tracked separately.
         if (merger != null) {
             BigInteger parentSafetime = merger.safeTimeForTablet(splitTabletId);
             for (TabletCheckpointPair pair : getTabletListResponse.getTabletCheckpointPairList()) {

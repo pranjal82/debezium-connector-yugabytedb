@@ -539,14 +539,14 @@ public class YBClientUtils {
             }
           } catch (DebeziumException de) {
             throw de;  // our own permanent error — propagate immediately
-          } catch (Exception ignored) {
+          } catch (Exception streamInfoError) {
             // If getDBStreamInfo itself fails with a permanent error (e.g. OBJECT_NOT_FOUND —
             // stream deleted), propagate immediately rather than retrying.
-            YugabyteDBCdcErrorClassifier.throwIfFailFast(ignored);
+            YugabyteDBCdcErrorClassifier.throwIfFailFast(streamInfoError);
             // getDBStreamInfo failed transiently (network blip, leader change, etc.);
             // fall through and let the normal retry logic handle it.
             LOGGER.warn("getDBStreamInfo check after TABLE_NOT_FOUND failed; "
-                    + "will retry normally. Cause: {}", ignored.getMessage());
+                    + "will retry normally. Cause: {}", streamInfoError.getMessage());
           }
         }
 

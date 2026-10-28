@@ -219,14 +219,10 @@ public class Merger {
 
     /**
      * @param tabletId tablet UUID
-     * @return true if the merge slot for the given tablet is empty or the tablet is not
-     *         registered (e.g. already removed via {@link #removeTablet}), false otherwise.
-     *         Does NOT register the tablet as a side effect — use {@link #ensureTablet} explicitly
-     *         if registration is needed.
+     * @return true if the merge slot for the given tablet is empty, false otherwise
      */
     public boolean isSlotEmpty(String tabletId) {
-        List<Message> slot = mergeSlots.get(tabletId);
-        return slot == null || slot.isEmpty();
+        return mergeSlots.get(tabletId).isEmpty();
     }
 
     /**

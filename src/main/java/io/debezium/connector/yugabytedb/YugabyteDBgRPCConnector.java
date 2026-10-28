@@ -47,8 +47,9 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
     private static final long MAX_TIMEOUT = 10000L;
 
     private Map<String, String> props;
-    private Set<String> tableIds;
     private List<HashPartition> hashRanges;
+    /** When "not a part of the stream ID" was first seen. Cleared when {@code fetchTableList} no longer reports it. */
+    private Long streamMembershipErrorSinceMs;
     private YugabyteDBConnectorConfig yugabyteDBConnectorConfig;
     private boolean usePublication;
 
@@ -57,22 +58,32 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
     public YugabyteDBgRPCConnector() {
     }
 
+    /** Marks the connector FAILED on the inherited context field and returns {@code error} to throw. */
+    private <E extends Exception> E raiseError(E error) {
+        context.raiseError(error);
+        return error;
+    }
+
     /**
-     * Calls {@link org.apache.kafka.connect.connector.ConnectorContext#raiseError} to mark this
-     * connector FAILED permanently, suppressing any {@link ClassCastException} that occurs when
-     * running inside an {@code EmbeddedEngine} test harness whose context does not implement
-     * {@link org.apache.kafka.connect.source.SourceConnectorContext}.  In that case the exception
-     * will propagate normally and stop the connector, which is the correct test behaviour.
+     * Retry a table missing from the stream until {@code max.connector.retries} ×
+     * {@code connector.retry.delay.ms} has passed, then mark the connector FAILED.
+     * {@code validate()} passes {@code raiseOnPermanentError=false} and only throws.
      */
-    private void raiseErrorSafely(Exception e) {
-        try {
-            context().raiseError(e);
+    private DebeziumException retryThenFail(DebeziumException error, boolean raiseOnPermanentError) {
+        if (!raiseOnPermanentError) {
+            return error;
         }
-        catch (ClassCastException ignored) {
-            // EmbeddedEngine's context() is not a SourceConnectorContext; raiseError() is
-            // unavailable.  The exception propagates through the normal call stack and stops
-            // the connector, so no additional action is required.
+        long now = System.currentTimeMillis();
+        if (streamMembershipErrorSinceMs == null) {
+            streamMembershipErrorSinceMs = now;
+            return error;
         }
+        long budgetMs = yugabyteDBConnectorConfig.maxConnectorRetries()
+                * yugabyteDBConnectorConfig.connectorRetryDelayMs();
+        if (now - streamMembershipErrorSinceMs >= budgetMs) {
+            return raiseError(error);
+        }
+        return error;
     }
 
     @Override
@@ -171,13 +182,7 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
         Configuration config = Configuration.from(this.props);
         Map<String, ConfigValue> results = validateAllFields(config);
 
-        // raiseOnPermanentError=true: mark connector FAILED immediately for config errors that
-        // cannot be resolved by retrying taskConfigs(). This flag is false on the validate()
-        // REST path so that thrown exceptions do not prematurely mark the connector FAILED.
-        // Capture the returned table set; it is committed to this.tableIds only after all
-        // subsequent steps in this method also succeed, ensuring previousTableIds always
-        // reflects a call that Kafka Connect received a valid task list from.
-        final Set<String> committedTableIds = validateTServerConnection(results, config, /* raiseOnPermanentError= */ true);
+        validateTServerConnection(results, config, /* raiseOnPermanentError= */ true);
 
         String streamIdValue = this.yugabyteDBConnectorConfig.streamId();
         LOGGER.debug("The streamid in config is {}", this.yugabyteDBConnectorConfig.streamId());
@@ -207,18 +212,14 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                     + " To forcefully use an IMPLICIT stream, set configuration property force.use.implicit.stream"
                     + " to true";
             // Permanent misconfiguration — retrying taskConfigs() will never succeed; mark FAILED now.
-            final DebeziumException permanentError = new DebeziumException(errorMessage);
-            raiseErrorSafely(permanentError);
-            throw permanentError;
+            throw raiseError(new DebeziumException(errorMessage));
         }
 
         if (this.yugabyteDBConnectorConfig.transactionOrdering() && !enableExplicitCheckpointing) {
             final String errorMessage = "Explicit checkpointing not enabled in consistent streaming mode, "
                     + "create a stream with explicit checkpointing and try again";
             // Permanent misconfiguration — retrying taskConfigs() will never succeed; mark FAILED now.
-            final DebeziumException permanentError = new DebeziumException(errorMessage);
-            raiseErrorSafely(permanentError);
-            throw permanentError;
+            throw raiseError(new DebeziumException(errorMessage));
         }
 
         LOGGER.info("DB stream ID being used: {}", streamIdValue);
@@ -263,10 +264,6 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
         }
 
         LOGGER.debug("Configuring {} YugabyteDB connector task(s)", taskConfigs.size());
-
-        // All steps succeeded — commit the new table set. previousTableIds on the next call
-        // will now reflect a fully completed taskConfigs() invocation, not a partial one.
-        this.tableIds = committedTableIds;
         return taskConfigs;
     }
 
@@ -372,20 +369,7 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
         return config.validate(YugabyteDBConnectorConfig.ALL_FIELDS);
     }
 
-    /**
-     * Validates the TServer connection, fetches the current table list, and builds
-     * {@link #hashRanges} for use by {@code taskConfigs()}.
-     *
-     * @param raiseOnPermanentError when {@code true} (called from {@code taskConfigs()}), calls
-     *        {@link org.apache.kafka.connect.connector.ConnectorContext#raiseError} before throwing
-     *        for errors that will never be resolved by retrying, stopping the infinite retry loop.
-     *        Must be {@code false} on the {@code validate()} / REST path so that thrown exceptions
-     *        do not prematurely mark the connector FAILED before {@code start()} is ever called.
-     * @return the set of table UUIDs confirmed present in the stream, to be committed to
-     *         {@link #tableIds} by the caller only after all subsequent steps in
-     *         {@code taskConfigs()} also succeed.
-     */
-    protected Set<String> validateTServerConnection(Map<String, ConfigValue> configValues,
+    protected void validateTServerConnection(Map<String, ConfigValue> configValues,
                                                     Configuration config,
                                                     boolean raiseOnPermanentError) {
         try (YBClient ybClient = YBClientUtils.getYbClient(yugabyteDBConnectorConfig)) {
@@ -404,8 +388,7 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                 // Permanent config error — no stream ID will ever appear without a config change.
                 final DebeziumException permanentError = new DebeziumException(
                         "DB Stream ID not provided, please provide a DB stream ID to proceed");
-                if (raiseOnPermanentError) raiseErrorSafely(permanentError);
-                throw permanentError;
+                throw raiseOnPermanentError ? raiseError(permanentError) : permanentError;
             }
 
             final ConfigValue streamIdConfig = configValues.get(YugabyteDBConnectorConfig.STREAM_ID.name());
@@ -414,8 +397,7 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                 // Permanent config error — table list will not appear without a config change.
                 final DebeziumException permanentError = new DebeziumException(
                         "The table.include.list is empty, please provide a list of tables to get the changes from");
-                if (raiseOnPermanentError) raiseErrorSafely(permanentError);
-                throw permanentError;
+                throw raiseOnPermanentError ? raiseError(permanentError) : permanentError;
             }
 
             // If the stream ID is not associated with any table then we should throw an exception
@@ -434,7 +416,7 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                 // new tables appear, so only stop retries for truly unrecoverable errors.
                 final DebeziumException wrappedException = new DebeziumException(errorMessage, e);
                 if (raiseOnPermanentError && YugabyteDBCdcErrorClassifier.isFailFast(e)) {
-                    raiseErrorSafely(wrappedException);
+                    throw raiseError(wrappedException);
                 }
                 throw wrappedException;
             }
@@ -449,12 +431,6 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                 throw new DebeziumException(errorMessage);
             }
 
-            // Pass the already-fetched stream info to avoid per-table getDBStreamInfo RPCs.
-            // Capture the previous tableIds BEFORE fetching the new list. this.tableIds is written
-            // by taskConfigs() only after this method AND all subsequent steps (getStreamInfo etc.)
-            // succeed, so previousTableIds reflects the last fully completed taskConfigs() call.
-            // It is null on the very first call ever and after any connector/worker restart.
-            final Set<String> previousTableIds = this.tableIds;
             // newTableIds is guaranteed non-null after the try block because the catch always
             // re-throws; initialize to null only to satisfy definite-assignment rules.
             Set<String> newTableIds = null;
@@ -462,55 +438,17 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                 newTableIds = YBClientUtils.fetchTableList(ybClient, this.yugabyteDBConnectorConfig,
                         getStreamInfoResp);
             } catch (DebeziumException e) {
-                // fetchTableList throws DebeziumException in two cases:
-                // - table in table.include.list not part of stream (YBClientUtils.java:163-164, permanent)
-                // - catch-all wrapper around ybClient.getTablesList() failures (YBClientUtils.java:181,
-                //   transient master/network errors)
-                // Only call raiseError for the permanent "not a part of the stream ID" case.
-                // Both cases arrive with a cause: the line-163 throw is inside the outer try, so
-                // the catch-all at line-181 re-wraps it as new DebeziumException(e) too.
-                // The substring check on getMessage() works because DebeziumException(Throwable)
-                // copies cause.toString() (which includes the original message) into the message
-                // field. Do NOT switch to a getCause()==null guard: both cases have a cause.
-                boolean isPermanentStreamMembership = e.getMessage() != null 
-                        && e.getMessage().contains("not a part of the stream ID");
-                
-                // "not in stream" can be transiently true in two scenarios:
-                //
-                // 1. Publication mode: YugabyteDBTablePoller fires requestTaskReconfiguration as
-                //    soon as a table appears in pg_publication_tables, but the master adds the
-                //    table to the CDCSDK stream asynchronously. taskConfigs() may run during that
-                //    window and see the table in fetchTableList but not yet in getDBStreamInfo.
-                //
-                // 2. gRPC mode with auto.add.new.tables=true: areThereNewTablesInStream() fires
-                //    requestTaskReconfiguration as soon as ONE new table appears in getDBStreamInfo.
-                //    A sibling table created in the same migration batch may still be missing from
-                //    the stream when taskConfigs() runs. getTablesList() returns it, fetchTableList
-                //    checks it against the cached streamInfoResponse, and throws.
-                //
-                // In both cases, let Kafka Connect retry taskConfigs() until the stream catches up.
-                // Only call raiseError when neither condition holds (genuine permanent misconfiguration).
-                //
-                // The sibling-table race (scenario 2) can happen on any taskConfigs() call,
-                // including the very first one: e.g. in the deploy-before-migration pattern the
-                // stream is empty on initial calls (throwing at :442 before fetchTableList runs),
-                // so previousTableIds stays null; when the stream picks up T1 first and T2 lags,
-                // the next call sees T2 missing with previousTableIds == null — using that as a
-                // "first call ever" signal would incorrectly fail fast on a transient state.
-                // Similarly, a worker restart creates a fresh connector instance with null
-                // previousTableIds even if tasks ran successfully before.
-                //
-                // KNOWN GAP: with autoAddNewTables=true a table genuinely removed from the stream
-                // is indistinguishable from propagation lag here and will retry forever. Fixing
-                // this requires per-table UUID tracking across restarts and is left for a follow-up.
-                boolean isTransientNotInStream = this.usePublication
-                        || this.yugabyteDBConnectorConfig.autoAddNewTables();
-
-                if (raiseOnPermanentError && isPermanentStreamMembership && !isTransientNotInStream) {
-                    raiseErrorSafely(e);
+                // Membership and getTablesList failures both have a cause. Match the message;
+                // do not use getCause()==null.
+                // raiseError only after this error has lasted max.connector.retries × connector.retry.delay.ms.
+                if (e.getMessage() != null && e.getMessage().contains("not a part of the stream ID")) {
+                    throw retryThenFail(e, raiseOnPermanentError);
                 }
                 throw e;
             }
+
+            // Membership error is gone. A later failure in this call must not keep the old start time.
+            streamMembershipErrorSinceMs = null;
 
             if (newTableIds == null || newTableIds.isEmpty()) {
                 // Not necessarily permanent: a table listed in table.include.list may be created
@@ -522,11 +460,8 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
             }
 
             this.hashRanges = new ArrayList<>();
-            // Tracks the tableId currently being processed so the catch block can reference it
-            String lastTableId = null;
             try {
                 for (String tableId : newTableIds) {
-                    lastTableId = tableId;
                     YBTable table = ybClient.openTableByUUID(tableId);
                     // Reuse the existing YBClient for the first attempt to avoid per-table TLS handshakes;
                     // retries (if any) fall back to a fresh client internally.
@@ -552,62 +487,23 @@ public class YugabyteDBgRPCConnector extends RelationalBaseSourceConnector {
                                 partitions.stream().map(HashPartition::getTabletId).collect(Collectors.toSet()));
                 }
             } catch (Exception e) {
-                // A DebeziumException here comes from getTabletListToPollForCDCWithRetry's
-                // TABLE_NOT_FOUND disambiguation check: getDBStreamInfo confirmed the table is
-                // absent from the stream.  Apply the same transient-not-in-stream guard used on
-                // the fetchTableList path above: if usePublication or autoAddNewTables is set,
-                // the table may have disappeared between fetchTableList and
-                // getTabletListToPollForCDC (e.g. dropped mid-taskConfigs(), or a sibling table
-                // in the same migration batch not yet propagated).  Let Kafka Connect retry
-                // taskConfigs() rather than going FAILED permanently in those cases.
-                //
-                // Narrow the autoAddNewTables guard by checking whether the failing tableId was
-                // tracked in the previous successful task configuration (previousTableIds).
-                // If it was previously tracked, it must have been removed from the stream —
-                // that is permanent regardless of auto.add.new.tables.
-                // If it is a new table (not in previousTableIds), the propagation-lag race applies.
+                // DebeziumException here is "no longer part of stream" from getTabletListToPollForCDCWithRetry.
+                // Rethrow; the next taskConfigs() hits fetchTableList and the membership timer decides.
                 if (e instanceof DebeziumException) {
-                    // lastTableId holds the UUID of the table that caused the exception.
-                    // If it was absent from the previous successful config it is a new table
-                    // (mid-taskConfigs() propagation-lag race); if it was present it was removed
-                    // from the stream (permanent).
-                    //
-                    // previousTableIds == null on the very first taskConfigs() call ever AND
-                    // after any connector/worker restart (fresh instance, this.tableIds not yet
-                    // written). In both cases isNewTable is forced to true, so with
-                    // auto.add.new.tables=true (the default) isTransientNotInStream is always
-                    // true and raiseErrorSafely is never called — a confirmed removal after a
-                    // restart retries forever.
-                    // KNOWN GAP: persisting tableIds across restarts is needed to fix this and
-                    // is left for a follow-up.
-                    boolean isNewTable = previousTableIds == null || !previousTableIds.contains(lastTableId);
-                    boolean isTransientNotInStream = this.usePublication
-                            || (this.yugabyteDBConnectorConfig.autoAddNewTables() && isNewTable);
-                    if (raiseOnPermanentError && !isTransientNotInStream) {
-                        raiseErrorSafely(e);
-                    }
                     throw (DebeziumException) e;
                 }
                 // MasterErrorException(OBJECT_NOT_FOUND) from openTableByUUID is permanent —
                 // consult the classifier before wrapping and retrying.
                 if (raiseOnPermanentError && YugabyteDBCdcErrorClassifier.isFailFast(e)) {
-                    final DebeziumException permanentError =
-                            new DebeziumException("Error while fetching all the tablets", e);
-                    raiseErrorSafely(permanentError);
-                    throw permanentError;
+                    throw raiseError(new DebeziumException("Error while fetching all the tablets", e));
                 }
                 final String errorMessage = "Error while fetching all the tablets";
                 LOGGER.error(errorMessage, e);
                 throw new DebeziumException(errorMessage, e);
             }
-            // Tablet loop completed without exception — return the confirmed table set.
-            // taskConfigs() commits it to this.tableIds only after all remaining steps succeed.
-            return newTableIds;
         }
         catch (Exception e) {
-            // DebeziumException instances have already had raiseErrorSafely() called where
-            // appropriate (permanent config/stream errors, Fix 2 TABLE_NOT_FOUND disambiguation).
-            // Pass them through unchanged. Re-wrap only unexpected non-DebeziumException failures.
+            // Permanent errors already called raiseError. Pass DebeziumException through.
             if (e instanceof DebeziumException) {
                 throw (DebeziumException) e;
             }
